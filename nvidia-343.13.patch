@@ -1,0 +1,370 @@
+diff -u -r NVIDIA-Linux-x86_64-343.13/kernel/uvm/nvidia_uvm_channel_mgmt_common.h NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/nvidia_uvm_channel_mgmt_common.h
+--- NVIDIA-Linux-x86_64-343.13/kernel/uvm/nvidia_uvm_channel_mgmt_common.h	2014-07-31 18:14:20.000000000 -0700
++++ NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/nvidia_uvm_channel_mgmt_common.h	2014-08-29 14:01:17.000000000 -0700
+@@ -33,14 +33,13 @@
+ #include "uvmtypes.h"
+ #include "nvidia_page_migration.h"
+ 
+-/*
+ #define UVM_PUSHBUFFER_RESERVATION_SIZE         (unsigned)(64 * 4096)
+ 
+ #define UVM_RINGBUFFER_POOL_DEFAULT_SIZE        (16u)
+ #define UVM_RINGBUFFER_DEFAULT_SIZE             (unsigned)(2 * 1024 * 1024)
+ 
+ #define UVM_CHANNEL_POOL_DEFAULT_SIZE           (16u)
+-*/
++/*
+ 
+ // TODO: This is only for testing. Should be removed (use the above instead).
+ #define UVM_PUSHBUFFER_RESERVATION_SIZE         (unsigned)(512)
+@@ -49,6 +48,7 @@
+ #define UVM_RINGBUFFER_DEFAULT_SIZE             (unsigned)(2 * 512)
+ 
+ #define UVM_CHANNEL_POOL_DEFAULT_SIZE           (2u)
++*/
+ 
+ #define UVM_READ_SEMA(sema) (*(volatile NvU32*)sema)
+ 
+@@ -71,13 +71,13 @@
+ #define UVM_PUSH_METHOD(ret, pb, func, ...) \
+     do { \
+         NvU64 numMethods = func( \
+-                (unsigned**)&pb->pbOffset, \
+-                (unsigned*)((NvU64)pushbuffer->cpuBegin + \
++                (unsigned**)&(pb)->pbOffset, \
++                (unsigned*)((NvU64)(pb)->cpuBegin + \
+                             UVM_PUSHBUFFER_RESERVATION_SIZE), \
+                 __VA_ARGS__); \
+         if (numMethods) \
+         { \
+-            pb->curOffset += numMethods; \
++            (pb)->curOffset += numMethods; \
+             ret = true; \
+         } \
+         else \
+diff -u -r NVIDIA-Linux-x86_64-343.13/kernel/uvm/nvidia_uvm_lite_api.c NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/nvidia_uvm_lite_api.c
+--- NVIDIA-Linux-x86_64-343.13/kernel/uvm/nvidia_uvm_lite_api.c	2014-07-31 18:14:20.000000000 -0700
++++ NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/nvidia_uvm_lite_api.c	2014-08-29 14:07:17.740587255 -0700
+@@ -22,6 +22,7 @@
+ *******************************************************************************/
+ 
+ #include "uvm_ioctl.h"
++#include "nvidia_uvm_channel_mgmt_common.h"
+ #include "nvidia_uvm_common.h"
+ #include "nvidia_uvm_lite.h"
+ #include "nvidia_uvm_lite_counters.h"
+@@ -503,3 +504,209 @@
+     up_read(&pProcessRecord->sessionInfoLock);
+     return rmStatus;
+ }
++
++#define UVM_PIN_WRITE          1
++#define UVM_PIN_NO_FORCE_WRITE 0
++
++#define ROUND_MULTIPLE_DOWN(x,n) ((x) / (n) * (n))
++#define ROUND_MULTIPLE_UP(x,n)   ROUND_MULTIPLE_DOWN((x) + (n) - 1, (n))
++#define MIN(x,y) ((x) < (y) ? (x) : (y))
++
++static
++int
++_uvm_pin_user_pages(unsigned long long start,
++                    NvLength           bytes,
++                    struct page     ***pages)
++{
++    unsigned long long alignedStart = ROUND_MULTIPLE_DOWN(start,
++						                             PAGE_SIZE);
++    unsigned long long alignedEnd   = ROUND_MULTIPLE_UP(start+bytes,
++						                           PAGE_SIZE);
++    int           totalPages   = (alignedEnd - alignedStart) / PAGE_SIZE;
++    struct page **tempPages    = kmalloc(totalPages * sizeof(struct page*), 0);
++    int           pinnedPages;
++  
++    if (!tempPages) {
++        UVM_DBG_PRINT_RL("page list alloc failed\n");
++        return -1;
++    }
++  
++    down_read(&current->mm->mmap_sem);
++    pinnedPages = get_user_pages(current, current->mm, alignedStart, totalPages,
++                                 UVM_PIN_WRITE, UVM_PIN_NO_FORCE_WRITE,
++                                 tempPages, NULL);
++    up_read(&current->mm->mmap_sem);
++  
++    if (pinnedPages < totalPages) {
++        UVM_DBG_PRINT_RL("get_user_pages failed %d\n", pinnedPages);
++        kfree(tempPages);
++        return -1;
++    }
++  
++    *pages = tempPages;
++  
++    return pinnedPages;
++}
++ 
++static
++void
++_uvm_unpin_user_pages(struct page **pages, int totalPages)
++{
++    int i;
++
++    for (i = 0; i < totalPages; i++)
++    {
++        if (!PageReserved(pages[i]))
++            set_page_dirty_lock(pages[i]);
++
++        page_cache_release(pages[i]);
++    }
++
++    kfree(pages);
++} 
++ 
++
++RM_STATUS
++uvm_api_dump_gpu_memory(UVM_DUMP_GPU_MEMORY_PARAMS *pParams, struct file *filp)
++{
++    RM_STATUS rmStatus;
++    UvmChannel *pChannel;
++    UvmChannelManager *pChannelManager = NULL;
++    UvmTracker tracker;
++    NvLength bytesRemaining = pParams->sizeBytes;
++    unsigned long long gpuAddress = pParams->baseAddress;
++    unsigned long long cpuAddress = (unsigned long long)pParams->pOutput;
++    unsigned long long limit = cpuAddress + bytesRemaining;
++    static const NvLength COPY_BLOCK_SIZE = 128*1024;
++    struct vm_area_struct *vma = NULL; 
++
++    // Only root is able to dump gpu memory
++    if (current_uid().val != 0)
++        return RM_ERR_INSUFFICIENT_PERMISSIONS;
++
++    if (cpuAddress % PAGE_SIZE)
++    {
++        return RM_ERR_INVALID_ARGUMENT;
++    }
++
++    if (gpuAddress % PAGE_SIZE)
++    {
++        return RM_ERR_INVALID_ARGUMENT;
++    }
++
++    // < as opposed to <= because 0 size is OK (but overflow is not)
++    if (limit < cpuAddress)
++    {
++        return RM_ERR_INVALID_ARGUMENT;
++    }
++
++    down_write(&current->mm->mmap_sem);
++    vma = find_vma(current->mm, cpuAddress);
++
++    if (!vma)
++    {
++        UVM_DBG_PRINT_RL("Invalid VMA\n");
++        up_write(&current->mm->mmap_sem);
++        return RM_ERR_INVALID_ADDRESS;
++    }
++
++    if (limit > vma->vm_end)
++    {
++        UVM_DBG_PRINT_RL("Range exceeds VMA: 0x%llx > 0x%llx\n",
++                limit, vma->vm_end);
++        up_write(&current->mm->mmap_sem);
++        return RM_ERR_INVALID_ADDRESS;
++    }
++
++    if (!(vma->vm_flags & (VM_WRITE)))
++    {
++        UVM_DBG_PRINT_RL("Invalid VM flags\n");
++        up_write(&current->mm->mmap_sem);
++        return RM_ERR_INVALID_ADDRESS;
++    }
++
++    up_write(&current->mm->mmap_sem);
++
++    rmStatus = uvm_create_channel_manager(&pParams->gpuUuid, &pChannelManager);
++    if (rmStatus != RM_OK)
++    {
++        UVM_DBG_PRINT_RL ("Failed to create channel manager\n");
++        goto done;
++    }
++    
++    while (bytesRemaining)
++    {
++        UvmPushbuffer *pPushbuffer = NULL;
++        NvLength toCopy = MIN(COPY_BLOCK_SIZE, bytesRemaining);
++        struct page **pages = NULL;
++        int pinnedPages = -1;
++        NvBool isPushSuccess; 
++        int pgnum;
++
++        // Pin the next chunk
++        pinnedPages = _uvm_pin_user_pages(cpuAddress,
++                                          toCopy, &pages);
++        if (pinnedPages <= 0)
++        {
++            UVM_DBG_PRINT_RL("Failed to pin pages 0x%llx 0x%llx %d\n", 
++                    cpuAddress, toCopy, pinnedPages);
++            rmStatus = RM_ERROR;
++            goto done;
++        }
++
++        // Get a pushbuffer (takes care of locks itself)
++        rmStatus = uvm_get_pushbuffer(pChannelManager, &pPushbuffer);
++
++        if (rmStatus != RM_OK)
++        {
++            _uvm_unpin_user_pages(pages, pinnedPages);
++            goto done;
++        }
++
++        pChannel = pPushbuffer->channel;
++        for (pgnum = 0; pgnum < pinnedPages; pgnum++)
++        {
++            UVM_PUSH_METHOD(isPushSuccess, pPushbuffer, pChannel->ceOps.launchDma,
++                            gpuAddress, NV_UVM_COPY_SRC_LOCATION_FB,
++                            (unsigned long long)page_to_phys(pages[pgnum]),
++                            NV_UVM_COPY_DST_LOCATION_SYSMEM,
++                            PAGE_SIZE,
++                            NV_UVM_COPY_SRC_TYPE_PHYSICAL |
++                            NV_UVM_COPY_DST_TYPE_PHYSICAL);
++
++
++            if (!isPushSuccess)
++            {
++                UVM_DBG_PRINT_RL("Failed to push methods\n");
++                _uvm_unpin_user_pages(pages, pinnedPages);
++                rmStatus = RM_ERROR;
++                goto done; 
++            }
++
++            gpuAddress += PAGE_SIZE;
++        }
++
++        rmStatus = uvm_submit_pushbuffer(pChannelManager, pPushbuffer,
++                                         NULL, &tracker);
++
++        if (rmStatus != RM_OK)
++        {
++            UVM_DBG_PRINT_RL("Failed to submit pushbuffer: %d\n", rmStatus);
++            _uvm_unpin_user_pages(pages, pinnedPages);
++            goto done;
++        }
++
++        uvm_wait_for_tracker(&tracker);
++        _uvm_unpin_user_pages(pages, pinnedPages);
++
++        bytesRemaining -= toCopy;
++        cpuAddress += toCopy;
++    }
++
++ done:
++
++    if (pChannelManager)
++        uvm_destroy_channel_manager(pChannelManager);
++
++    return rmStatus;
++}
+diff -u -r NVIDIA-Linux-x86_64-343.13/kernel/uvm/nvidia_uvm_lite.c NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/nvidia_uvm_lite.c
+--- NVIDIA-Linux-x86_64-343.13/kernel/uvm/nvidia_uvm_lite.c	2014-07-31 18:14:20.000000000 -0700
++++ NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/nvidia_uvm_lite.c	2014-08-29 14:01:17.000000000 -0700
+@@ -1581,6 +1581,7 @@
+         UVM_ROUTE_CMD(UVM_REMOVE_SESSION,         uvm_api_remove_session);
+         UVM_ROUTE_CMD(UVM_MAP_COUNTER,            uvm_api_map_counter);
+         UVM_ROUTE_CMD(UVM_ENABLE_COUNTERS,        uvm_api_enable_counters);
++        UVM_ROUTE_CMD(UVM_DUMP_GPU_MEMORY,        uvm_api_dump_gpu_memory);
+         default:
+             UVM_ERR_PRINT("Unknown: cmd: 0x%0x\n", cmd);
+             return -EINVAL;
+@@ -1674,9 +1675,15 @@
+                                                 &g_uvmKernelPrivRegionLength))
+         goto fail;
+ 
++    if (RM_OK != uvm_initialize_channel_mgmt_api())
++        goto fail;
++
+     return 0;
+ 
+ fail:
++
++    uvm_deinitialize_channel_mgmt_api();
++
+     kmem_cache_destroy_safe(&g_uvmMappingCache);
+     kmem_cache_destroy_safe(&g_uvmStreamRecordCache);
+     kmem_cache_destroy_safe(&g_uvmMigTrackerCache);
+@@ -1687,6 +1694,7 @@
+     if (cdevAlloced)
+         cdev_del(&g_uvmlite_cdev);
+ 
++
+     UVM_ERR_PRINT("Failed\n");
+     return ret;
+ 
+diff -u -r NVIDIA-Linux-x86_64-343.13/kernel/uvm/nvidia_uvm_lite.h NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/nvidia_uvm_lite.h
+--- NVIDIA-Linux-x86_64-343.13/kernel/uvm/nvidia_uvm_lite.h	2014-07-31 18:14:20.000000000 -0700
++++ NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/nvidia_uvm_lite.h	2014-08-29 14:01:17.000000000 -0700
+@@ -266,6 +266,8 @@
+ 
+ struct file;
+ 
++RM_STATUS uvm_api_dump_gpu_memory(UVM_DUMP_GPU_MEMORY_PARAMS *pParams,
++                             struct file *filp);
+ //
+ //
+ // UVM-Lite char driver entry points:
+diff -u -r NVIDIA-Linux-x86_64-343.13/kernel/uvm/uvm.h NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/uvm.h
+--- NVIDIA-Linux-x86_64-343.13/kernel/uvm/uvm.h	2014-07-31 18:14:20.000000000 -0700
++++ NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/uvm.h	2014-08-29 14:01:17.000000000 -0700
+@@ -375,6 +375,33 @@
+ RM_STATUS UvmGetFileDescriptor(int *returnedFd);
+ #endif
+ 
++/*******************************************************************************
++    UvmDumpGpuMemory
++
++    This is a debug command that will dump arbitraty GPU memory locations into
++    a provided CPU memory buffer.  It does no validation of the input address,
++    so it is necessary for the caller to make sure it is within the limits of
++    the GPU's available memory.
++
++    For security this is only enabled when a special build flag is enabled and
++    will only be available to root users.
++
++    Arguments:
++        pGpuUuidStruct: (INPUT)
++            Which GPU to dump memory from
++        pOutput: (OUTPUT)
++            The output buffer of atleast the size specified by sizeBytes
++        gpuMemoryBase: (INPUT)
++            The physical location of GPU memory to start dumping from.
++        sizeBytes: (INPUT)
++            How many bytes to copy
++    
++*/
++RM_STATUS UvmDumpGpuMemory(UvmGpuUuid *pGpuUuidStruct, 
++                           void* pOutput, 
++                           unsigned long long baseAddress, 
++                           NvLength sizeBytes);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff -u -r NVIDIA-Linux-x86_64-343.13/kernel/uvm/uvm_ioctl.h NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/uvm_ioctl.h
+--- NVIDIA-Linux-x86_64-343.13/kernel/uvm/uvm_ioctl.h	2014-07-31 18:14:20.000000000 -0700
++++ NVIDIA-Linux-x86_64-343.13-fbdump/kernel/uvm/uvm_ioctl.h	2014-08-29 14:01:17.000000000 -0700
+@@ -248,6 +248,17 @@
+     RM_STATUS          rmStatus;      // OUT
+ } UVM_MAP_COUNTER_PARAMS;
+ 
++#define UVM_DUMP_GPU_MEMORY                                           UVM_IOCTL_BASE(21)
++
++typedef struct
++{
++    UvmGpuUuid         gpuUuid;                    // IN
++    NvP64              pOutput NV_ALIGN_BYTES(8);  // OUT
++    unsigned long long baseAddress;                // IN
++    NvLength           sizeBytes;                  // IN
++    RM_STATUS          rmStatus;                   // OUT
++} UVM_DUMP_GPU_MEMORY_PARAMS;
++
+ #ifdef __cplusplus
+ }
+ #endif

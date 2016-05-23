@@ -1,0 +1,434 @@
+/////////////////////////////////////////////////////////////////////////////////
+//   Copyright (c) 2014 NVidia Corporation
+//
+//   Permission is hereby granted, free of charge, to any person obtaining a copy
+//   of this software and associated documentation files (the "Software"), to
+//   deal in the Software without restriction, including without limitation the
+//   rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+//   sell copies of the Software, and to permit persons to whom the Software is
+//   furnished to do so, subject to the following conditions:
+//
+//       The above copyright notice and this permission notice shall be
+//       included in all copies or substantial portions of the Software.
+//
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//   THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//   DEALINGS IN THE SOFTWARE.
+//
+/////////////////////////////////////////////////////////////////////////////////
+
+//
+//
+// v1.0, first distribution on 9/18/2014.
+// Added check to make sure application is running with root privs, which is
+// required for correct operation. Clarified some error conditions and improved
+// checks for bad GPU UUID values.
+// All 9/14/2014 by Golden G. Richard III / @nolaforensix.
+//
+//
+
+#include "gtest/gtest.h"
+
+extern "C" {
+#include "common-utils.h"
+#include "nvgetopt.h"
+}
+#include "dump_fb.h"
+#include "uvm.h"
+
+#include <nvml.h>
+
+#include <stdlib.h>
+#include <malloc.h>
+#include <sys/mman.h>
+#include <time.h>
+
+static const NvU32 PAGE_SIZE = 4096;
+
+const char* uuid = NULL;
+
+class DumpFbTest : public ::testing::Test {
+    public:
+        void SetUp();
+        void TearDown();
+    protected:
+        UvmGpuUuid uvmUuid;
+};
+
+int getNumGpus() {
+    unsigned int gpuCount = 0;
+    nvmlReturn_t nvmlStatus = nvmlDeviceGetCount(&gpuCount);
+    if (nvmlStatus != NVML_SUCCESS) {
+        nv_error_msg("Could not get GPU count\n");
+        return -1;
+    }
+
+    return gpuCount;
+}
+
+void nvmlUuidToUvmUuid(const char* nvmlUuid, UvmGpuUuid* uvmUuid) {
+    sscanf(nvmlUuid, "GPU-%2x%2x%2x%2x-%2x%2x-%2x%2x-%2x%2x-%2x%2x%2x%2x%2x%2x", 
+            (unsigned int*) &uvmUuid->uuid[0],
+            (unsigned int*) &uvmUuid->uuid[1],
+            (unsigned int*) &uvmUuid->uuid[2],
+            (unsigned int*) &uvmUuid->uuid[3],
+            (unsigned int*) &uvmUuid->uuid[4],
+            (unsigned int*) &uvmUuid->uuid[5],
+            (unsigned int*) &uvmUuid->uuid[6],
+            (unsigned int*) &uvmUuid->uuid[7],
+            (unsigned int*) &uvmUuid->uuid[8],
+            (unsigned int*) &uvmUuid->uuid[9],
+            (unsigned int*) &uvmUuid->uuid[10],
+            (unsigned int*) &uvmUuid->uuid[11],
+            (unsigned int*) &uvmUuid->uuid[12],
+            (unsigned int*) &uvmUuid->uuid[13],
+            (unsigned int*) &uvmUuid->uuid[14],
+            (unsigned int*) &uvmUuid->uuid[15]);
+}
+
+const char* getRequestedUuid(const char* uuid) {
+    unsigned int gpuCount = 0;
+    unsigned int i;
+    nvmlReturn_t nvmlStatus;
+    char devuuid[NVML_DEVICE_UUID_BUFFER_SIZE];
+    char *retuuid = NULL;
+
+    gpuCount = getNumGpus();
+    if (strlen(uuid) >= NVML_DEVICE_UUID_BUFFER_SIZE) {
+        printf("Requested UUID is too long (Max UUID length %d)\n", 
+                NVML_DEVICE_UUID_BUFFER_SIZE);
+        return NULL;
+    }
+
+    for (i = 0; i < gpuCount; i++) {
+        nvmlDevice_t device;
+        nvmlStatus = nvmlDeviceGetHandleByIndex(i, &device);
+
+        if (nvmlStatus != NVML_SUCCESS)  {
+            printf("Could not retrieve device index %d\n", i);
+            continue;
+        }
+
+        nvmlStatus = nvmlDeviceGetUUID(device, devuuid, sizeof(devuuid));
+        if (nvmlStatus != NVML_SUCCESS) {
+            printf("Could not retrieve UUID for device index %d\n", i);
+            continue;
+        }
+
+        if (strncmp(uuid, &devuuid[4], strlen(uuid)) == 0) {
+            if (retuuid) {
+                printf("Ambiguous UUID fragment\n");
+                free(retuuid);
+                return NULL;
+            }
+            retuuid = strdup(devuuid);
+        }
+    }
+
+    return retuuid;
+}
+
+
+void DumpFbTest::SetUp() {
+    ASSERT_EQ(nvmlInit(), NVML_SUCCESS);
+    ASSERT_EQ(UvmInitialize(), RM_OK);
+    const char *u = getRequestedUuid(uuid);
+    if (! u) {
+        nv_error_msg("Bad GPU UUID. Use nvidia-smi -L to see\n"
+		     "a list of UUIDs. Omit the \"GPU-\" portion for -g.\n");
+	exit(-1);
+    }
+    nvmlUuidToUvmUuid(u, &uvmUuid);
+}
+
+void DumpFbTest::TearDown() {
+    UvmDeinitialize();
+    nvmlShutdown();
+}
+
+
+TEST_F(DumpFbTest, ZeroLength) {
+    void* ptr = mmap(NULL, PAGE_SIZE,  
+            PROT_READ|PROT_WRITE, 
+            MAP_ANONYMOUS|MAP_PRIVATE, 
+            -1, 0);
+    ASSERT_TRUE(ptr);
+    memset(ptr, 0x42, PAGE_SIZE);
+    ASSERT_EQ(UvmDumpGpuMemory(&uvmUuid, ptr, 0, 0), 
+            (RM_STATUS)RM_OK);
+    ASSERT_EQ(*(NvU8*)ptr, 0x42);
+    munmap(ptr, PAGE_SIZE);
+}
+
+TEST_F(DumpFbTest, NullPtr) {
+    ASSERT_NE(UvmDumpGpuMemory(&uvmUuid, NULL, 0, PAGE_SIZE), 
+            (RM_STATUS)RM_OK);
+}
+
+TEST_F(DumpFbTest, RandomPtr) {
+    void* ptr = (void*) (random() & 0xFFFFFFFF);
+    ASSERT_NE(UvmDumpGpuMemory(&uvmUuid, ptr, 0, PAGE_SIZE), 
+            (RM_STATUS)RM_OK);
+
+}
+
+TEST_F(DumpFbTest, ReadOnly) {
+    void* ptr = mmap(NULL, PAGE_SIZE,  PROT_READ, MAP_ANONYMOUS|MAP_PRIVATE, 
+            -1, 0);
+    ASSERT_NE(ptr, MAP_FAILED);
+    
+    ASSERT_NE(UvmDumpGpuMemory(&uvmUuid, ptr, 0, PAGE_SIZE), 
+            (RM_STATUS)RM_OK);
+    munmap(ptr, PAGE_SIZE);
+}
+
+TEST_F(DumpFbTest, BasicTest) {
+    void* ptr = mmap(NULL, PAGE_SIZE,  
+            PROT_READ|PROT_WRITE, 
+            MAP_ANONYMOUS|MAP_PRIVATE, 
+            -1, 0);
+
+    ASSERT_NE(ptr, MAP_FAILED);
+
+    ASSERT_EQ(UvmDumpGpuMemory(&uvmUuid, ptr, 0, PAGE_SIZE), 
+            (RM_STATUS)RM_OK);
+
+    munmap(ptr, PAGE_SIZE);
+}
+
+TEST_F(DumpFbTest, LargeTest) {
+    void* ptr = mmap(NULL, 64*1024*1024,  
+            PROT_READ|PROT_WRITE, 
+            MAP_ANONYMOUS|MAP_PRIVATE, 
+            -1, 0);
+
+    ASSERT_NE(ptr, MAP_FAILED);
+
+    ASSERT_EQ(UvmDumpGpuMemory(&uvmUuid, ptr, 0, 64*1024*1024), 
+            (RM_STATUS)RM_OK);
+
+    munmap(ptr, 64*1024*1024);
+}
+
+// Relies on the first 4 KB pages of FB not being the same
+TEST_F(DumpFbTest, OffsetTest) {
+    void* ptr = mmap(NULL, PAGE_SIZE,  
+            PROT_READ|PROT_WRITE, 
+            MAP_ANONYMOUS|MAP_PRIVATE, 
+            -1, 0);
+
+    void* ptr2 = mmap(NULL, PAGE_SIZE,  
+            PROT_READ|PROT_WRITE, 
+            MAP_ANONYMOUS|MAP_PRIVATE, 
+            -1, 0);
+
+    ASSERT_NE(ptr, MAP_FAILED);
+    ASSERT_NE(ptr2, MAP_FAILED);
+
+    ASSERT_EQ(UvmDumpGpuMemory(&uvmUuid, ptr, 0, PAGE_SIZE), 
+            (RM_STATUS)RM_OK);
+
+    ASSERT_EQ(UvmDumpGpuMemory(&uvmUuid, ptr2, PAGE_SIZE, PAGE_SIZE), 
+            (RM_STATUS)RM_OK);
+
+    ASSERT_NE(memcmp(ptr, ptr2, PAGE_SIZE), 0);
+}
+
+//
+// Copies the same FB location multiple times, relies on someone not changing
+// the memory while testing.  We use address 0, which may be where VGA lives.
+// So it is possible this may fail when using the GPU as a VGA adapter.
+//
+TEST_F(DumpFbTest, ConsistencyCheck) {
+    void* ptr = mmap(NULL, PAGE_SIZE,  
+            PROT_READ|PROT_WRITE, 
+            MAP_ANONYMOUS|MAP_PRIVATE, 
+            -1, 0);
+
+    void* ptr2 = mmap(NULL, PAGE_SIZE,  
+            PROT_READ|PROT_WRITE, 
+            MAP_ANONYMOUS|MAP_PRIVATE, 
+            -1, 0);
+
+    ASSERT_NE(ptr, MAP_FAILED);
+    ASSERT_NE(ptr2, MAP_FAILED);
+
+    ASSERT_EQ(UvmDumpGpuMemory(&uvmUuid, ptr, 0, PAGE_SIZE), 
+            (RM_STATUS)RM_OK);
+
+    ASSERT_EQ(UvmDumpGpuMemory(&uvmUuid, ptr2, 0, PAGE_SIZE), 
+            (RM_STATUS)RM_OK);
+
+    ASSERT_EQ(memcmp(ptr, ptr2, PAGE_SIZE), 0);
+}
+
+TEST_F(DumpFbTest, UnalignedCpuAddress) {
+    void* ptr = mmap(NULL, PAGE_SIZE,  
+            PROT_READ|PROT_WRITE, 
+            MAP_ANONYMOUS|MAP_PRIVATE, 
+            -1, 0);
+
+    ASSERT_NE(UvmDumpGpuMemory(&uvmUuid, ptr, 1, PAGE_SIZE), 
+            (RM_STATUS)RM_OK);
+
+    munmap(ptr, PAGE_SIZE);
+}
+
+TEST_F(DumpFbTest, OverflowTest) {
+    void* ptr = mmap(NULL, PAGE_SIZE,  
+            PROT_READ|PROT_WRITE, 
+            MAP_ANONYMOUS|MAP_PRIVATE, 
+            -1, 0);
+    unsigned long long size = (0ll) - (unsigned long long) ptr + 1;
+    ASSERT_NE(UvmDumpGpuMemory(&uvmUuid, ptr, 1, size), 
+            (RM_STATUS)RM_OK);
+
+    munmap(ptr, PAGE_SIZE);
+}
+
+class PerformanceTest : public ::testing::TestWithParam<NvLength> {
+    public:
+        static void SetUpTestCase();
+        static void TearDownTestCase();
+
+        static UvmGpuUuid uvmUuid;
+
+        void SetUp();
+        void TearDown();
+    protected:
+        void* ptr;
+
+};
+
+UvmGpuUuid PerformanceTest::uvmUuid;
+
+// Share the init as it takes a while (has to load the driver)
+void PerformanceTest::SetUpTestCase() {
+    ASSERT_EQ(nvmlInit(), NVML_SUCCESS);
+    ASSERT_EQ(UvmInitialize(), RM_OK);
+    const char *u = getRequestedUuid(uuid);
+    if (! u) {
+        nv_error_msg("Bad GPU UUID. Use nvidia-smi -L to see\n"
+		     "a list of UUIDs. Omit the \"GPU-\" portion for -g.\n");
+	exit(-1);
+    }
+    nvmlUuidToUvmUuid(u, &uvmUuid);
+}
+void PerformanceTest::TearDownTestCase() {
+    UvmDeinitialize();
+    nvmlShutdown();
+}
+
+void PerformanceTest::SetUp() {
+
+    ptr = mmap(NULL, GetParam(),  PROT_READ|PROT_WRITE,
+            MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+}
+
+void PerformanceTest::TearDown() {
+    munmap(ptr, GetParam());
+}
+
+unsigned long diff(const timespec start, const timespec end) {
+    unsigned long t1 = start.tv_sec*1000000000  + start.tv_nsec;
+    unsigned long t2 = end.tv_sec*1000000000  + end.tv_nsec;
+    return t2-t1;
+}
+
+TEST_P(PerformanceTest, TestBandwidth) {
+    timespec time1, time2;
+    clock_gettime(CLOCK_REALTIME, &time1);
+    ASSERT_EQ(UvmDumpGpuMemory(&uvmUuid, ptr, 0, GetParam()), 
+            (RM_STATUS)RM_OK);
+    clock_gettime(CLOCK_REALTIME, &time2);
+
+    unsigned long elapsed = diff(time1, time2);
+    std::cout << elapsed/1000000.0 << "ms\n";
+    std::cout << (GetParam()/(1024.0*1024*1024))/(elapsed/1000000000.0) << "GB/s\n";
+}
+
+TEST_P(PerformanceTest, TestBandwidthLocked) {
+    timespec time1, time2;
+    EXPECT_EQ(mlock(ptr, GetParam()), 0);
+    clock_gettime(CLOCK_REALTIME, &time1);
+    ASSERT_EQ(UvmDumpGpuMemory(&uvmUuid, ptr, 0, GetParam()), 
+            (RM_STATUS)RM_OK);
+    clock_gettime(CLOCK_REALTIME, &time2);
+    munlock(ptr, GetParam());
+
+    unsigned long elapsed = diff(time1, time2);
+    std::cout << elapsed/1000000.0 << "ms\n";
+    std::cout << (GetParam()/(1024.0*1024*1024))/(elapsed/1000000000.0) << "GB/s\n";
+}
+
+INSTANTIATE_TEST_CASE_P(PerformanceTest, PerformanceTest,
+        ::testing::Values(4096, 1024*1024, 64*1024*1024, 
+            128*1024*1024, 1024*1024*1024));
+
+
+static const NVGetoptOption __options[] = {
+
+    { "help",
+      'h',
+      NVGETOPT_HELP_ALWAYS,
+      NULL,
+      "Print usage information for the command line options and exit." },
+
+    { "gpu",
+      'g',
+      NVGETOPT_STRING_ARGUMENT | NVGETOPT_HELP_ALWAYS,
+      "GPU-UUID",
+      "The GPU UUID to extract data from.  To get the available UUIDs "
+      "use nvidia-smi -L (note don't include the \"GPU-\" prefix"
+    },
+
+    { NULL, 0, 0, NULL, NULL },
+};
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+
+    while (1)  {
+        int c, intval;
+        char *strval  = NULL;
+
+        c = nvgetopt(argc,
+                     argv,
+                     __options,
+                     &strval, /* strval */
+                     NULL, /* boolval */
+                     &intval,
+                     NULL, /* doubleval */
+                     NULL); /* disable */
+
+        if (c == -1) break;
+
+        switch (c)  {
+            case 'g':
+                uuid = strval;
+                break;
+            default:
+                nv_error_msg("Invalid commandline, please run `%s --help` "
+                             "for usage information.\n", argv[0]);
+                return -1;
+        }
+    }
+
+    if (!uuid) {
+        nv_error_msg("Must provide a UUID using -g.  Use nvidia-smi -L to see "
+		     "a list of UUIDs.  Omit the \"GPU-\" portion for -g.\n");
+        return -1;
+    }
+
+    if (getuid() != 0 && geteuid() != 0 ) {
+      nv_error_msg("Must be run with root privileges.  Try sudo ./dump_fb_test <args> instead.\n");
+      return -1;
+    }
+
+    return RUN_ALL_TESTS();
+}
+

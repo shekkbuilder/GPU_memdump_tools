@@ -1,0 +1,171 @@
+Introduction
+============
+This package contains a patch to the NVIDIA GPU driver and an associated user
+space application and testing framework to expose the ability for a process to dump
+physical ranges of GPU memory.  The tools MUST be run as root.
+
+File Contents
+=============
+* dump_fb.[ch] - Utility functions shared between application and tests
+* dump_fb_main.c - The main application that dumps memory contents to a file
+* dump_fb_test.cpp - The test application (built on google-test)
+* uvm.c - wrappers around the needed UVM ioctls
+* nvgetopt.[ch] - Portable getopt_long implementation
+* msg.[ch] - Print formatting utilities
+* common-utils.[ch] portable versions of some common functions
+* nvidia-343.13.patch - Kernel driver patch exposing the new FB dumping
+  functionality
+* gtest/ - a copy of the fused sources from google-test version 1.7
+  (https://code.google.com/p/googletest/)
+
+Known Issues
+============
+* The open source kernel code does not have a way to query if a given GPU
+  address is valid.  Therefore passing large or otherwise invalid addresses
+  will cause undefined behavior.  The dump_fb application will check that
+  memory being dumped is within the size of GPU memory.
+
+* Note on some GPUs the size of memory does not correspond to
+  the largest physical offset.  These GPUs are not supported by this utility.
+
+* The memory system for GPUs differs substantially from that of a typical CPU.
+  Some of these differecnes may affect the results of the memory dumping tool,
+  including but not limited to:
+    
+    * Address swizzling:  The relationship between linear physical address and
+      raw DRAM location depends on several factors.  Therefore a write to
+      location A through one mapping may not correspond to location A when read
+      through another (e.g. this tool).  
+
+    * Bandwidth Compression: Certain types of writes to GPU memory will result
+      in sparse updates of the underlying memory.  The associated tracking
+      state needed to know the full contents is stored on-chip and will not be
+      read by this tool.
+
+* The new ioctl is not yet thread safe.  Calling from multiple
+  processes/threads is causing intermittent soft lockups.  For now, ASSUME THAT 
+  ONLY ONE PROCESS MAY DUMP GPU MEMORY AT A TIME.
+
+Installation
+============
+The following instructions are based on a clean XUbuntu / Ubuntu 14.04
+install.  All tests were performed on this setup and using a single
+GTX 750Ti Maxwell-based GPU.  If you succeed in building the tools on
+another platform, please share your experiences (via email to golden@cs.uno.edu) and 
+I will post them on the page.
+
+Commands starting with '#' must be run with elevated privileges.
+
+$DUMP_FB is the location of the extracted tarball containing this README.
+
+1. Install prerequisite libraries
+
+        # apt-get install gcc make 
+
+    If you want to build and run the tests then you also need C++ support
+
+        # apt-get install g++
+
+2. Before installing the NVIDIA driver you must blacklist nouveau, as it will be loaded by default.
+
+        # echo "blacklist nouveau" > /etc/modprobe.d/nouveau.conf
+        # rmmod nouveau
+
+3. Download the NVIDIA 343.13 Beta driver package (http://www.geforce.com/drivers/results/77410). This is
+important, because the patch is designed to be applied to this release only.
+
+        $ mkdir nvidia && cd nvidia
+        $ curl -O http://us.download.nvidia.com/XFree86/Linux-x86_64/343.13/NVIDIA-Linux-x86_64-343.13.run
+     
+4. Since we are patching the kernel driver we must expand the installer package
+   so it can be patched before installing.
+
+        $ bash NVIDIA-Linux-x86_64-343.13.run -x
+
+5. Apply the patch to the extracted driver
+
+        $ cd NVIDIA-Linux-x86_64-343.13/
+        $ patch -p1  -i $DUMP_FB/nvidia-343.13.patch
+
+6. Now run the installer to install the NVIDIA driver.
+
+        # ./nvidia-installer
+
+7. Assuming no errors occur, the patched driver should now be installed.  A quick
+   sanity check to verify the driver can properly communicate with the GPU is to
+   run the nvidia-smi command.  It will query some information about the GPUs in
+   the system.
+
+        $ nvidia-smi
+
+If you're using a 750 Ti, for example, output should be similar to:
+
++------------------------------------------------------+
+| NVIDIA-SMI 343.13     Driver Version: 343.13         |
+|-------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
+|===============================+======================+======================|
+|   0  GeForce GTX 860M    Off  | 0000:01:00.0     N/A |                  N/A |
+| N/A   43C    P0    N/A /  N/A |      7MiB /  2047MiB |     N/A      Default |
++-------------------------------+----------------------+----------------------+
+
++-----------------------------------------------------------------------------+
+| Compute processes:                                               GPU Memory |
+|  GPU       PID  Process name                                     Usage      |
+|=============================================================================|
+|    0            Not Supported                                               |
++-----------------------------------------------------------------------------+
+
+9. Install the GPU Deployment Kit which contains the needed headers to use the NVML library
+
+        $ curl -O http://developer.download.nvidia.com/compute/cuda/6_5/rel/installers/cuda_340_29_gdk_linux_64.run
+        # bash cuda_340_29_gdk_linux_64.run
+
+10. Now build the dump_fb utility.  If you did not follow the directory
+    structure in previous instructions then you will need to set the make variable
+    DRIVER_DIR to the path of the extracted GPU driver directory.
+
+        $ cd $DUMP_FB
+        $ make dump_fb
+
+    To build everything, including tests
+        $ make all
+
+Assuming all went well you should have a patched driver and the
+dump_fb utility, the combination of which will provide the ability to
+dump physical GPU memory.
+
+For details on using the dump_fb utility, execute "./dump_fb --help"
+
+
+Testing
+=======
+A few simple tests are included separately from the dump_fb program. 
+
+To build them you can do either
+
+    $ make all
+
+Which builds everything, including `dump_fb` (this is the default).  Or build
+it directly with:
+
+    $ make dump_fb_test
+
+To run the tests:
+    
+    $ sudo ./dump_fb_test -g <GPU-UUID>
+
+Troubleshooting
+===============
+
+*   Errors loading the kernel module
+
+    If dump_fb shows errors like this:
+
+        Cannot initialize UVM
+        UVM error: failed to load the kernel driver
+
+The most likely reason is you are not running as root.  The only command that
+will work reliably as non-root is --help.
+
